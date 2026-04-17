@@ -6,7 +6,7 @@ from ultralytics import YOLO
 app = Flask(__name__)
 
 # Load the TFLite model
-model = YOLO('yolov8n_float32.tflite') 
+model = YOLO('yolov8n.pt') 
 
 SAFE_LIMIT = 5
 WARNING_LIMIT = 15
