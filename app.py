@@ -5,46 +5,56 @@ from ultralytics import YOLO
 # Initialize Flask app
 app = Flask(__name__)
 
-# Load the TFLite model
-model = YOLO('yolov8n.pt') 
+# Load the TFLite model for edge-optimized inference
+model = YOLO('yolov8n_float32.tflite')
 
+# Multi-camera configuration
+CAMERAS = {
+    "cam1": "http://192.168.168.101:8080/video",  # Update with your actual IP Webcam URLs
+    "cam2": "http://192.168.168.48:8080/video"
+}
+current_camera_key = "cam1"
+
+# Thresholds for crowd density
 SAFE_LIMIT = 5
-WARNING_LIMIT = 15
-
-# Connect to the IP Webcam feed (⚠️ REPLACE THIS WITH YOUR EXACT PHONE URL)
-video_url = "http://192.168.168.48:8080/video" 
+WARNING_LIMIT = 10
 
 def generate_frames():
-    cap = cv2.VideoCapture(video_url)
+    global current_camera_key
     
-    if not cap.isOpened():
-        print(f"CRITICAL ERROR: OpenCV cannot connect to {video_url}. Check the phone app!")
-    
+    active_url = CAMERAS[current_camera_key]
+    cap = cv2.VideoCapture(active_url)
     frame_counter = 0
 
     while True:
-        try: # [cite: 290]
+        try:
+            # Seamless Camera Switching Interception
+            if CAMERAS[current_camera_key] != active_url:
+                cap.release() # Drop the old connection
+                active_url = CAMERAS[current_camera_key]
+                cap = cv2.VideoCapture(active_url) # Connect to the new phone
+
             success, frame = cap.read()
             
-            # 1. Check if the camera is sending empty frames
+            # Check for empty frames
             if not success:
                 print("DEBUG ERROR: Camera connected, but sending empty frames!")
-                break
+                continue
                 
+            # Frame skipping optimization: process every 3rd frame
             frame_counter += 1
-            
-            # Frame skipping: only process every 3rd frame to maintain FPS on CPU
             if frame_counter % 3 != 0:
                 continue
 
-            # Resize for speed
-            frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_NEAREST)
+            # Orientation and Resize Fixes for Portrait Mode
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            frame = cv2.resize(frame, (480, 640), interpolation=cv2.INTER_NEAREST)
 
-            # Run TFLite Inference
-            results = model(frame, classes=[0], conf=0.40, iou=0.30)
+            # YOLO Inference (Tuned for people only, with strict NMS/IoU)
+            results = model(frame, classes=[0], conf=0.35, iou=0.30)
             people_count = len(results[0].boxes)
 
-            # Determine UI Overlay Color based on density limits
+            # Dynamic UI Overlay Logic
             if people_count <= SAFE_LIMIT:
                 overlay_color = (0, 255, 0)      # Green
                 status_text = "Density: LOW"
@@ -55,60 +65,80 @@ def generate_frames():
                 overlay_color = (0, 0, 255)      # Red
                 status_text = "Density: HIGH"
 
-            # Draw the UI Overlay
+            # Draw the UI
             annotated_frame = results[0].plot()
-            h, w = annotated_frame.shape[:2]
+            cv2.rectangle(annotated_frame, (10, 10), (470, 630), overlay_color, thickness=15)
             
-            # Create semi-transparent bounding box
-            overlay = annotated_frame.copy()
-            cv2.rectangle(overlay, (10, 10), (w - 10, h - 10), overlay_color, thickness=15)
-            alpha = 0.6
-            cv2.addWeighted(overlay, alpha, annotated_frame, 1 - alpha, 0, annotated_frame)
-
-            # Create solid background box for the text
+            # Background box for text readability
             cv2.rectangle(annotated_frame, (15, 15), (350, 60), (0, 0, 0), -1)
             cv2.putText(annotated_frame, f"{status_text} ({people_count})", (25, 45),
                         cv2.FONT_HERSHEY_DUPLEX, 0.8, overlay_color, 2)
 
-            # INSTEAD OF cv2.imshow, we encode the frame as a JPEG for the web stream
+            # Encode frame for Flask web stream
             ret, buffer = cv2.imencode('.jpg', annotated_frame)
             frame_bytes = buffer.tobytes()
 
-            # Yield the frame in byte format for the web stream
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
                    
-        # 2. Catch and print any hidden YOLO/OpenCV crashes [cite: 292]
         except Exception as e:
+            # Diagnostic safety net
             print(f"\n❌ PYTHON CRASHED INSIDE THE LOOP: {e}\n")
             break
 
     cap.release()
+
+# Route to handle background camera switching
+@app.route('/switch_camera/<camera_id>')
+def switch_camera(camera_id):
+    global current_camera_key
+    if camera_id in CAMERAS:
+        current_camera_key = camera_id
+        return "Switched successfully", 200
+    return "Camera not found", 404
 
 # Route to serve the video feed
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# Basic HTML page to display the feed nicely
+# Multi-Camera Frontend Dashboard
 @app.route('/')
 def index():
     return '''
     <html>
         <head>
-            <title>Crowd Density Monitor</title>
+            <title>Multi-Cam Crowd Density</title>
             <style>
                 body { background-color: #121212; color: white; text-align: center; font-family: sans-serif; }
                 img { max-width: 100%; height: auto; border: 2px solid #333; margin-top: 20px; }
+                .btn { 
+                    padding: 10px 20px; margin: 10px; font-size: 16px; 
+                    background-color: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer;
+                }
+                .btn:hover { background-color: #0056b3; }
             </style>
+            <script>
+                // Calls the backend to switch cameras without reloading the page
+                function switchCam(camId) {
+                    fetch('/switch_camera/' + camId)
+                        .then(response => console.log('Requested switch to ' + camId));
+                }
+            </script>
         </head>
         <body>
             <h2>Live Crowd Density Dashboard</h2>
-            <img src="/video_feed" />
+            
+            <div>
+                <button class="btn" onclick="switchCam('cam1')">View Camera 1</button>
+                <button class="btn" onclick="switchCam('cam2')">View Camera 2</button>
+            </div>
+
+            <img id="videoStream" src="/video_feed" />
         </body>
     </html>
     '''
 
 if __name__ == '__main__':
-    # host='0.0.0.0' exposes the server to your local network [cite: 203, 204]
+    # Listen on all IP addresses to broadcast to the mobile device
     app.run(host='0.0.0.0', port=5000, debug=False)
